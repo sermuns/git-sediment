@@ -4,7 +4,9 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-gix = { version = "0.80", default-features = false, features = ["blob-diff", "blame"] }
+gix = { version = "0.80", default-features = false, features = ["blob-diff", "blame", "parallel"] }
 color-eyre = { version = "0.6", default-features = false, features = ["track-caller"] }
 chrono = { version = "0.4",  default-features = false }
 kuva = { version = "0.1", default-features = false }
+rayon = "1"
+indicatif = "0.18"

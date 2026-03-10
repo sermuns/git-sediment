@@ -1,7 +1,9 @@
 use chrono::{DateTime, Utc};
 use color_eyre::eyre::{Context, OptionExt};
 use gix::{Repository, objs::tree::EntryKind, repository::blame_file};
+use indicatif::ProgressBar;
 use kuva::prelude::*;
+use rayon::prelude::*;
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::Path,
@@ -12,15 +14,11 @@ type Layers = BTreeMap<gix::date::Time, u32>;
 fn open_repo(repo_path: impl AsRef<Path>) -> color_eyre::Result<Repository> {
     let mut repo = gix::discover(repo_path)?.with_object_memory();
     repo.object_cache_size(32 * 1024);
-    eprintln!(
-        "opened repo at {}",
-        repo.workdir().unwrap_or_else(|| repo.git_dir()).display()
-    );
     Ok(repo)
 }
 
-fn layers_for_commit(repo: &Repository, commit_id: gix::Id) -> (gix::date::Time, Layers) {
-    let commit = repo.find_commit(commit_id).unwrap();
+fn layers_for_commit(repo: &Repository, oid: gix::ObjectId) -> (gix::date::Time, Layers) {
+    let commit = repo.find_commit(oid).unwrap();
     let commit_time = commit.time().expect("commit time should be present");
 
     let tree = commit.tree().unwrap();
@@ -103,27 +101,38 @@ fn main() -> color_eyre::Result<()> {
         .install()?;
 
     let repo_path = std::env::args().nth(1).ok_or_eyre("must provide path")?;
-    let repo = open_repo(repo_path)?;
+    let repo = open_repo(&repo_path)?;
+    eprintln!(
+        "opened repo at {}",
+        repo.workdir().unwrap_or_else(|| repo.git_dir()).display()
+    );
 
     let head_id = repo
         .head()?
         .try_into_peeled_id()?
         .ok_or_eyre("repo doesn't have any commits")?;
 
-    let commit_ids: Vec<gix::Id> = head_id
+    let commit_ids: Vec<_> = head_id
         .ancestors()
         .all()?
         .map_while(Result::ok)
-        .map(|c| c.id())
+        .map(|c| c.id().detach())
         .collect();
 
-    eprintln!("found {} commits", commit_ids.len());
+    let num_commits = commit_ids.len();
+    eprintln!("found {} commits", num_commits);
 
-    let mut data = Vec::with_capacity(commit_ids.len());
-    for id in commit_ids {
-        eprintln!("processing commit {}", id);
-        data.push(layers_for_commit(&repo, id));
-    }
+    let pb = ProgressBar::new(num_commits as u64);
+
+    let data: Vec<_> = commit_ids
+        .into_par_iter()
+        .map(|oid| {
+            let repo = open_repo(&repo_path).unwrap();
+            let layers = layers_for_commit(&repo, oid);
+            pb.inc(1);
+            layers
+        })
+        .collect();
 
     eprintln!("{} time points", data.len());
     render_stacked_area_plot(&data)?;
