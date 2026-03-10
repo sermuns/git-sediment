@@ -46,7 +46,10 @@ fn layers_for_commit(repo: &Repository, oid: gix::ObjectId) -> (gix::date::Time,
     (commit_time, layers)
 }
 
-fn render_stacked_area_plot(data: &[(gix::date::Time, Layers)]) -> color_eyre::Result<()> {
+fn render_stacked_area_plot(
+    data: &[(gix::date::Time, Layers)],
+    title: &str,
+) -> color_eyre::Result<()> {
     let times: BTreeSet<_> = data.iter().flat_map(|(_, layers)| layers.keys()).collect();
 
     let x: Vec<f64> = data.iter().map(|(t, _)| t.seconds as f64).collect();
@@ -84,7 +87,7 @@ fn render_stacked_area_plot(data: &[(gix::date::Time, Layers)]) -> color_eyre::R
 
     let plots = vec![Plot::StackedArea(sa)];
     let layout = Layout::auto_from_plots(&plots)
-        .with_title("Surviving LoC by year of last change")
+        .with_title(title)
         .with_x_label("Commit time (unix seconds)")
         .with_y_label("Lines of code");
 
@@ -135,7 +138,15 @@ fn main() -> color_eyre::Result<()> {
         .collect();
 
     eprintln!("{} time points", data.len());
-    render_stacked_area_plot(&data)?;
+    render_stacked_area_plot(
+        &data,
+        repo.workdir()
+            .unwrap()
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap(),
+    )?;
 
     Ok(())
 }
