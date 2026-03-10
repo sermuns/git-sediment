@@ -6,3 +6,4 @@ edition = "2024"
 [dependencies]
 gix = { version = "0.80", default-features = false, features = ["blob-diff", "blame"] }
 color-eyre = { version = "0.6", default-features = false, features = ["track-caller"] }
+chrono = { version = "0.4",  default-features = false }
