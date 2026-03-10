@@ -1,28 +1,20 @@
-use chrono::{DateTime, Datelike};
-use color_eyre::eyre::{Context, ContextCompat, OptionExt};
-use gix::{Repository, objs::tree::EntryKind, prelude::*, repository::blame_file};
-use std::{collections::HashMap, num::NonZeroU32, path::Path};
+use color_eyre::eyre::{Context, OptionExt};
+use gix::{Repository, fs::stack, objs::tree::EntryKind, repository::blame_file};
+use kuva::prelude::*;
+use std::{
+    collections::{HashMap, HashSet},
+    path::Path,
+};
 
-type Layers = HashMap<YearQuarter, u32>;
+type Layers = HashMap<Year, u32>;
 
-#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
-struct YearQuarter {
-    year: i32,
-    quarter: u8,
-}
+#[derive(Debug, Hash, Eq, PartialEq, Clone)]
+struct Year(u16);
 
-impl From<gix::date::Time> for YearQuarter {
+impl From<gix::date::Time> for Year {
     fn from(ts: gix::date::Time) -> Self {
-        let seconds = ts.seconds;
-        let datetime = DateTime::from_timestamp(seconds, 0).expect("valid timestamp");
-
-        let month = datetime.month();
-        let quarter = ((month - 1) / 3 + 1) as u8;
-
-        YearQuarter {
-            year: datetime.year(),
-            quarter,
-        }
+        // FIXME: divide by seconds in year
+        Self(u16::try_from(ts.seconds / (365 * 24 * 60 * 60)).unwrap())
     }
 }
 
@@ -34,6 +26,30 @@ fn open_repo(repo_path: impl AsRef<Path>) -> color_eyre::Result<Repository> {
         repo.workdir().unwrap_or_else(|| repo.git_dir()).display()
     );
     Ok(repo)
+}
+
+fn render_stacked_area_plot(data: &[(gix::date::Time, Layers)]) {
+    let unique_years: HashSet<Year> = data
+        .iter()
+        .flat_map(|(_, layers)| layers.keys().cloned())
+        .collect();
+
+    let mut stacked_area_plot =
+        StackedAreaPlot::new().with_x(data.iter().map(|(time, _)| time.seconds as f64));
+
+    for year in unique_years {
+        stacked_area_plot = stacked_area_plot.with_series(
+            data.iter()
+                .map(|(_, layers)| *layers.get(&year).unwrap_or(&0)),
+        )
+    }
+
+    // TODO: set title and legend
+    let plots = vec![Plot::StackedArea(stacked_area_plot)];
+    let layout = Layout::auto_from_plots(&plots);
+
+    let svg = SvgBackend.render_scene(&render_multiple(plots, layout));
+    std::fs::write("output.svg", svg).unwrap();
 }
 
 fn main() -> color_eyre::Result<()> {
@@ -50,10 +66,14 @@ fn main() -> color_eyre::Result<()> {
         .peel_to_commit()
         .wrap_err("repo doesn't have any commits")?;
 
-    let mut series: Vec<(gix::date::Time, Layers)> = Vec::new();
+    let mut data: Vec<(gix::date::Time, Layers)> = Vec::new();
 
+    // check all (currently) tracked files
+    // FIXME: should check all historically tracked files, maybe loop through all commits instead??
     for entry in head.tree()?.iter() {
         let entry = entry?;
+
+        // NOTE: need other kinds too maybe?
         if entry.kind() != EntryKind::Blob {
             continue;
         }
@@ -66,14 +86,15 @@ fn main() -> color_eyre::Result<()> {
 
         for hunk in blame.entries {
             let commit_time = repo.find_commit(hunk.commit_id).unwrap().time().unwrap();
-            let quarter = YearQuarter::from(commit_time);
-            *layers.entry(quarter).or_default() += u32::from(hunk.len);
+            let year = Year::from(commit_time);
+            *layers.entry(year).or_default() += u32::from(hunk.len);
         }
 
-        series.push((head.time().unwrap(), layers));
+        data.push((head.time().unwrap(), layers));
     }
 
-    eprintln!("series: {:#?}", series);
+    eprintln!("{} data points", data.len());
+    render_stacked_area_plot(&data);
 
     Ok(())
 }
