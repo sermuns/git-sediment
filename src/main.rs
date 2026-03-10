@@ -1,26 +1,17 @@
+use chrono::{DateTime, Utc};
 use color_eyre::eyre::{Context, OptionExt};
-use gix::{Repository, fs::stack, objs::tree::EntryKind, repository::blame_file};
+use gix::{Repository, objs::tree::EntryKind, repository::blame_file};
 use kuva::prelude::*;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet},
     path::Path,
 };
 
-type Layers = HashMap<Year, u32>;
-
-#[derive(Debug, Hash, Eq, PartialEq, Clone)]
-struct Year(u16);
-
-impl From<gix::date::Time> for Year {
-    fn from(ts: gix::date::Time) -> Self {
-        // FIXME: divide by seconds in year
-        Self(u16::try_from(ts.seconds / (365 * 24 * 60 * 60)).unwrap())
-    }
-}
+type Layers = BTreeMap<gix::date::Time, u32>;
 
 fn open_repo(repo_path: impl AsRef<Path>) -> color_eyre::Result<Repository> {
-    let mut repo = gix::discover(repo_path)?.with_object_memory(); // TODO: check if it has impact
-    repo.object_cache_size(32 * 1024); // TODO: figure out how to choose!
+    let mut repo = gix::discover(repo_path)?.with_object_memory();
+    repo.object_cache_size(32 * 1024);
     eprintln!(
         "opened repo at {}",
         repo.workdir().unwrap_or_else(|| repo.git_dir()).display()
@@ -28,28 +19,81 @@ fn open_repo(repo_path: impl AsRef<Path>) -> color_eyre::Result<Repository> {
     Ok(repo)
 }
 
-fn render_stacked_area_plot(data: &[(gix::date::Time, Layers)]) {
-    let unique_years: HashSet<Year> = data
-        .iter()
-        .flat_map(|(_, layers)| layers.keys().cloned())
-        .collect();
+fn layers_for_commit(repo: &Repository, commit_id: gix::Id) -> (gix::date::Time, Layers) {
+    let commit = repo.find_commit(commit_id).unwrap();
+    let commit_time = commit.time().expect("commit time should be present");
 
-    let mut stacked_area_plot =
-        StackedAreaPlot::new().with_x(data.iter().map(|(time, _)| time.seconds as f64));
+    let tree = commit.tree().unwrap();
 
-    for year in unique_years {
-        stacked_area_plot = stacked_area_plot.with_series(
-            data.iter()
-                .map(|(_, layers)| *layers.get(&year).unwrap_or(&0)),
-        )
+    let mut layers: Layers = BTreeMap::new();
+
+    for entry in tree.iter() {
+        let entry = entry.unwrap();
+        if entry.kind() != EntryKind::Blob {
+            continue;
+        }
+        let path = entry.filename();
+
+        let blame = repo
+            .blame_file(path, commit.id, blame_file::Options::default())
+            .unwrap();
+
+        for hunk in blame.entries {
+            let blamed_commit = repo.find_commit(hunk.commit_id).unwrap();
+            let blamed_time = blamed_commit.time().unwrap();
+            *layers.entry(blamed_time).or_default() += u32::from(hunk.len);
+        }
     }
 
-    // TODO: set title and legend
-    let plots = vec![Plot::StackedArea(stacked_area_plot)];
-    let layout = Layout::auto_from_plots(&plots);
+    (commit_time, layers)
+}
+
+fn render_stacked_area_plot(data: &[(gix::date::Time, Layers)]) -> color_eyre::Result<()> {
+    let times: BTreeSet<_> = data.iter().flat_map(|(_, layers)| layers.keys()).collect();
+
+    let x: Vec<f64> = data.iter().map(|(t, _)| t.seconds as f64).collect();
+
+    let palette = [
+        "steelblue",
+        "orange",
+        "mediumseagreen",
+        "tomato",
+        "slateblue",
+        "goldenrod",
+        "hotpink",
+        "teal",
+        "peru",
+        "darkseagreen",
+    ];
+
+    let mut sa = StackedAreaPlot::new().with_x(x);
+
+    for (idx, time) in times.iter().enumerate() {
+        let series: Vec<f64> = data
+            .iter()
+            .map(|(_, layers)| layers.get(time).copied().unwrap_or(0) as f64)
+            .collect();
+
+        let color = palette[idx % palette.len()];
+        sa = sa
+            .with_series(series)
+            .with_color(color)
+            .with_legend(format!(
+                "{}",
+                DateTime::<Utc>::from_timestamp(time.seconds, 0).unwrap()
+            ));
+    }
+
+    let plots = vec![Plot::StackedArea(sa)];
+    let layout = Layout::auto_from_plots(&plots)
+        .with_title("Surviving LoC by year of last change")
+        .with_x_label("Commit time (unix seconds)")
+        .with_y_label("Lines of code");
 
     let svg = SvgBackend.render_scene(&render_multiple(plots, layout));
-    std::fs::write("output.svg", svg).unwrap();
+    std::fs::write("output.svg", svg).wrap_err("failed to write output.svg")?;
+
+    Ok(())
 }
 
 fn main() -> color_eyre::Result<()> {
@@ -61,40 +105,28 @@ fn main() -> color_eyre::Result<()> {
     let repo_path = std::env::args().nth(1).ok_or_eyre("must provide path")?;
     let repo = open_repo(repo_path)?;
 
-    let head = repo
+    let head_id = repo
         .head()?
-        .peel_to_commit()
-        .wrap_err("repo doesn't have any commits")?;
+        .try_into_peeled_id()?
+        .ok_or_eyre("repo doesn't have any commits")?;
 
-    let mut data: Vec<(gix::date::Time, Layers)> = Vec::new();
+    let commit_ids: Vec<gix::Id> = head_id
+        .ancestors()
+        .all()?
+        .map_while(Result::ok)
+        .map(|c| c.id())
+        .collect();
 
-    // check all (currently) tracked files
-    // FIXME: should check all historically tracked files, maybe loop through all commits instead??
-    for entry in head.tree()?.iter() {
-        let entry = entry?;
+    eprintln!("found {} commits", commit_ids.len());
 
-        // NOTE: need other kinds too maybe?
-        if entry.kind() != EntryKind::Blob {
-            continue;
-        }
-
-        let path = entry.filename();
-
-        let blame = repo.blame_file(path, head.id, blame_file::Options::default())?;
-
-        let mut layers = Layers::new();
-
-        for hunk in blame.entries {
-            let commit_time = repo.find_commit(hunk.commit_id).unwrap().time().unwrap();
-            let year = Year::from(commit_time);
-            *layers.entry(year).or_default() += u32::from(hunk.len);
-        }
-
-        data.push((head.time().unwrap(), layers));
+    let mut data = Vec::with_capacity(commit_ids.len());
+    for id in commit_ids {
+        eprintln!("processing commit {}", id);
+        data.push(layers_for_commit(&repo, id));
     }
 
-    eprintln!("{} data points", data.len());
-    render_stacked_area_plot(&data);
+    eprintln!("{} time points", data.len());
+    render_stacked_area_plot(&data)?;
 
     Ok(())
 }
