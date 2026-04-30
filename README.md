@@ -15,3 +15,5 @@ Inspired by [git-archaeology](https://github.com/koaning/gitcharts) and [git-of-
 - [ ] Make plot prettier
 
 - [ ] Expereiment with other export types
+
+- [ ] Optimize exported SVG: for big datasets its lagging the browser when viewing(!!)
